@@ -22,8 +22,6 @@ public class Main {
   private File fifo;
   //! Max idle time in minutes. If 0 no maximum idle time
   private int idle_time_m;
-  //! True when a command has been received and something is running
-  private bool command_received;
   private SwitchableOutputStream err;
   private SwitchableOutputStream out;
   private SwitchableInputStream  in;
@@ -38,7 +36,6 @@ public class Main {
 
   public Main(String unique_id, String working_directory) throws IOException
   {
-    this.command_received = false;
     this.unique_id = unique_id;
     this.dir = new File(working_directory);
     // We don't rely on stdin/out/err
@@ -57,8 +54,7 @@ public class Main {
       return; // I guess someone wanted to kill the timeout thread?
     }
 
-    if (!this.command_received)
-        System.exit(0);
+    System.exit(0);
   }
 
   private void startIdleKiller() {
@@ -88,7 +84,6 @@ public class Main {
     Method main = mainMethod(mainClass);
     mergeEnv(parseEnv(environment));
     setProperties(runtimeArgs);
-    this.command_received = true;
 //     switchStreams();
     startIdleKiller();
     invoke(main, split(mainArgs, "\u0000"));
