@@ -154,8 +154,11 @@ class CJavaPrefork(object):
         process_position = len(processes)
         unique_id = "{}.{}".format(group_name_hash.hexdigest(), process_position)
         fifo_name = "control.{}".format(unique_id)
-        [pathlib.Path(item).unlink(True) for item in
-         (fifo_name, "stdout.{}".format(unique_id), "stderr.{}".format(unique_id))]
+        for item in fifo_name, "stdout.{}".format(unique_id), "stderr.{}".format(unique_id):
+            try:
+                pathlib.Path(item).unlink()
+            except OSError:
+                pass
 
         os.mkfifo(fifo_name)
 
@@ -265,18 +268,18 @@ class CJavaPrefork(object):
 
 
 if __name__ == "__main__":
-    import doctest
-    doctest.testmod()
-    # logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
+    #~ import doctest
+    #~ doctest.testmod()
+    logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
     # parser = argparse.ArgumentParser(prog="drip")
     # parser.add_argument("command", choices=("ps", "version", "kill"), nargs="?", default=None)
     # drip_command, java_args = parser.parse_known_args()
 
-    # drip = CJavaPrefork(".")
-    # drip.java_path = "/opt/JRE1.8.0/bin/java"
-    # drip.prefork_jvm("jasperstarter", "/home/corbelli/compile/jasperstarter-3.5/lib/jasperstarter.jar")
-    # drip.prefork_jvm("test")
-    # print(drip)
+    drip = CJavaPrefork(".")
+    drip.java_path = r"c:\Program Files (x86)\Java\jre1.8.0_144\bin\java.exe"
+    drip.prefork_jvm("jasperstarter", r"c:\Program Files (x86)\jasperstarter\lib\jasperstarter.jar")
+    drip.prefork_jvm("test")
+    print(drip)
     # drip.exec_(
     #     "jasperstarter",
     #     "de.cenote.jasperstarter.App",
