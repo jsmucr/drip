@@ -13,40 +13,52 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class Main {
-  private List<Switchable> lazyStreams;
   private String mainClass;
+  //! Working directory
   private File dir;
+  //! Unique JVM instance ID assigned by parent
+  private String unique_id;
+  //! Control FIFO
+  private File fifo;
+  //! Max idle time in minutes. If 0 no maximum idle time
+  private int idle_time_m;
+  //! True when a command has been received and something is running
+  private bool command_received;
   private SwitchableOutputStream err;
   private SwitchableOutputStream out;
   private SwitchableInputStream  in;
 
-  public Main(String mainClass, String dir) {
-    this.mainClass = mainClass;
-    this.dir = new File(dir);
+  //! Default idle time in minutes
+  public static final int IDLE_TIME_M = 240;
+
+  public static void main(String[] args) throws IOException, Exception
+  {
+    new Main(args[0], args[1]).start();
+  }
+
+  public Main(String unique_id, String working_directory) throws IOException
+  {
+    this.command_received = false;
+    this.unique_id = unique_id;
+    this.dir = new File(working_directory);
+    // We don't rely on stdin/out/err
+    System.in.close();
+    System.out.close();
+    System.err.close();
+    String idleTimeStr = System.getenv("DRIP_SHUTDOWN"); // in minutes
+    idleTimeStr == null ? this.idle_time_m = this.IDLE_TIME_M : this.idle_time_m = Integer.parseInt(idleTimeStr);
   }
 
   private void killAfterTimeout() {
-    String idleTimeStr = System.getenv("DRIP_SHUTDOWN"); // in minutes
-    int idleTime;
-    if (idleTimeStr == null) {
-      idleTime = 4 * 60; // four hours
-    } else {
-      idleTime = Integer.parseInt(idleTimeStr);
-    }
-
     try {
-      Thread.sleep(idleTime * 60 * 1000); // convert minutes to ms
+      Thread.sleep(this.idle_time_m * 60 * 1000); // convert minutes to ms
     } catch (InterruptedException e) {
-      System.err.println("drip: Interrupted??");
+      System.err.println("drip: Interrupted timeout thread??");
       return; // I guess someone wanted to kill the timeout thread?
     }
 
-    File lockDir = new File(dir, "lock");
-    if (lockDir.mkdir()) {
-      System.exit(0);
-    } else {
-      // someone is already connected; let the process finish
-    }
+    if (!this.command_received)
+        System.exit(0);
   }
 
   private void startIdleKiller() {
@@ -60,37 +72,33 @@ public class Main {
     idleKiller.start();
   }
 
-  public static void main(String[] args) throws Exception {
-    new Main(args[0], args[1]).start();
-  }
-
   public void start() throws Exception {
     reopenStreams();
 
-    Method main = mainMethod(mainClass);    
-    Method init = mainMethod(System.getenv("DRIP_INIT_CLASS"));
-    String initArgs = System.getenv("DRIP_INIT");
-    initArgs = initArgs == null ? "" : initArgs;
-    invoke(init == null ? main : init, split(initArgs, "\n"));
-    startIdleKiller();
-
-    Scanner fromBash = new Scanner(new File(dir, "control"));
-    String mainArgs    = readString(fromBash);
+    // Will block until we get commands
+    Scanner fromBash = new Scanner(this.fifo);
+    this.mainClass = readString(fromBash);
+    // Target program args separated by \u0000
+    String mainArgs = readString(fromBash);
+    // System properties separated by \u0000, i.e. -DA=B\u0000-DX=Y
     String runtimeArgs = readString(fromBash);
+    // Environment variables separated by \u0000, i.e. A=B\u0000C=D
     String environment = readString(fromBash);
     fromBash.close();
-
+    Method main = mainMethod(mainClass);
     mergeEnv(parseEnv(environment));
     setProperties(runtimeArgs);
-    switchStreams();
-
+    this.command_received = true;
+//     switchStreams();
+    startIdleKiller();
     invoke(main, split(mainArgs, "\u0000"));
   }
 
   private Method mainMethod(String className)
-    throws ClassNotFoundException, NoSuchMethodException {
+    throws ClassNotFoundException, NoSuchMethodException
+  {
     if (className == null || className.equals("")) {
-      return null;
+      throw new ClassNotFoundException("No class name specified");
     } else {
       return Class.forName(className, true, ClassLoader.getSystemClassLoader())
         .getMethod("main", String[].class);
@@ -169,13 +177,23 @@ public class Main {
   }
 
   private void reopenStreams() throws FileNotFoundException, IOException {
-    this.in  = new SwitchableInputStream(System.in, new File(dir, "in"));
-    this.out = new SwitchableOutputStream(System.out, new File(dir, "out"));
-    this.err = new SwitchableOutputStream(System.err, new File(dir, "err"));
+    this.fifo = new File(this.dir, String.format("control.%s", unique_id));
+    System.setOut(new PrintStream(new File(dir, String.format("stdout.%s", unique_id))));
+    System.setErr(new PrintStream(new File(dir, String.format("stderr.%s", unique_id))));
 
-    System.setIn(new BufferedInputStream(in));
-    System.setOut(new PrintStream(out));
-    System.setErr(new PrintStream(err));
+//     this.in  = new SwitchableInputStream(
+//         System.in, new File(dir, String.format("stdin.%s", unique_id)
+//     );
+//     this.out = new SwitchableOutputStream(
+//         System.out, new File(dir, String.format("stdout.%s", unique_id)
+//     );
+//     this.err = new SwitchableOutputStream(
+//         System.err, new File(dir, String.format("stderr.%s", unique_id)
+//     );
+
+//     System.setIn(new BufferedInputStream(in));
+//     System.setOut(new PrintStream(out));
+//     System.setErr(new PrintStream(err));
   }
 
   private void switchStreams() throws Exception {
