@@ -1,4 +1,7 @@
 package org.flatland.drip;
+
+import java.lang.System;
+import java.lang.UnsupportedOperationException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
@@ -12,22 +15,41 @@ import java.util.Arrays;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-public class Main {
+/** This is meant to be the entry point of a forked child
+ *  that waits for the another entry point (the real meat)
+ *  and executes it.
+ *  The purpose is to have a pool of preforked processes
+ *  waiting in order to amortize the JVM startup time.
+ *  Processes have an "unique ID" assigned by parent that is meant
+ *  to be used to group them.
+ *  They have their own file as stdout and stderr and do NOT
+ *  have stdin.
+ *  Stdout is stdout.<unique id> and stderr is stderr.<unique id>.
+ *  The communication channel is a java.io.Scanner on the top
+ *  of a named pipe created by the parent. A standard named pipe
+ *  control.<unique id> in the working directory is used on
+ *  *NIX (man mkfifo) and \\.\pipe\preforkj.control.<unique id>
+ *  works for windows.
+ */
+public class Main
+{
   private String mainClass;
   //! Working directory
   private File dir;
-  //! Unique JVM instance ID assigned by parent
+  //! Unique JVM group instance ID assigned by parent
   private String unique_id;
   //! Control FIFO
   private File fifo;
-  //! Max idle time in minutes. If 0 no maximum idle time
-  private int idle_time_m;
-  private SwitchableOutputStream err;
-  private SwitchableOutputStream out;
-  private SwitchableInputStream  in;
+  /** Max running time in minutes. If 0 no maximum running time.
+   *  If the child real entry point does not exit within this
+   *  time the JVM instance is shut down.
+   */
+  private int max_running_time_m;
+  private boolean is_windows;
+  private boolean is_linux;
 
-  //! Default idle time in minutes
-  public static final int IDLE_TIME_M = 240;
+  //! Default maximum running time in minutes
+  public static final int MAX_RUNNING_TIME_M = 5;
 
   public static void main(String[] args) throws IOException, Exception
   {
@@ -36,71 +58,95 @@ public class Main {
 
   public Main(String unique_id, String working_directory) throws IOException
   {
+    String current_os = System.getProperty("os.name").toLowerCase();
+    this.is_windows = (current_os.indexOf("win") >= 0);
+    this.is_linux = (current_os.indexOf("nux") >= 0);
+    if ((!this.is_windows) && (!this.is_linux))
+      throw new UnsupportedOperationException("Unsupported OS");
+
     this.unique_id = unique_id;
     this.dir = new File(working_directory);
-    // We don't rely on stdin/out/err
+    // We don't rely on stdin and have our own stdout/err files
     System.in.close();
     System.out.close();
     System.err.close();
+    System.setOut(new PrintStream(new File(dir, String.format("stdout.%s", unique_id))));
+    System.setErr(new PrintStream(new File(dir, String.format("stderr.%s", unique_id))));
+
+    if (this.is_linux) {
+      // standard mkfifo on *NIX
+      this.fifo = new File(this.dir, String.format("control.%s", unique_id));
+    } else if (this.is_windows) {
+      // windows flavour
+      this.fifo = new File(String.format("\\\\.\\pipe\\preforkj.control.%s", unique_id));
+    }
+
     String idleTimeStr = System.getenv("DRIP_SHUTDOWN"); // in minutes
-    idleTimeStr == null ? this.idle_time_m = this.IDLE_TIME_M : this.idle_time_m = Integer.parseInt(idleTimeStr);
+    this.max_running_time_m = (idleTimeStr == null) ? this.MAX_RUNNING_TIME_M : Integer.parseInt(idleTimeStr);
+    startIdleKiller();
   }
 
-  private void killAfterTimeout() {
+  private void killAfterTimeout()
+  {
     try {
-      Thread.sleep(this.idle_time_m * 60 * 1000); // convert minutes to ms
+      Thread.sleep(this.max_running_time_m * 60 * 1000); // convert minutes to ms
     } catch (InterruptedException e) {
       System.err.println("drip: Interrupted timeout thread??");
       return; // I guess someone wanted to kill the timeout thread?
     }
-
+    System.err.printf("Exiting after %d [min] timeout\n", this.max_running_time_m);
     System.exit(0);
   }
 
-  private void startIdleKiller() {
-    Thread idleKiller = new Thread() {
-        public void run() {
-          killAfterTimeout();
-        }
-      };
+  private void startIdleKiller()
+  {
+    if (this.max_running_time_m != 0) {
+      Thread idleKiller = new Thread() {
+          public void run() {
+            killAfterTimeout();
+          }
+        };
 
-    idleKiller.setDaemon(true);
-    idleKiller.start();
+      idleKiller.setDaemon(true);
+      idleKiller.start();
+    }
   }
 
-  public void start() throws Exception {
-    reopenStreams();
-
+  public void start() throws Exception
+  {
     // Will block until we get commands
-    Scanner fromBash = new Scanner(this.fifo);
-    this.mainClass = readString(fromBash);
+    Scanner command_stream = new Scanner(this.fifo);
+    // On windows if the parent exits (or disconnects the server pipe handle)
+    // it is treated as an event that unblocks read, but of course we
+    // don't have any data and a java.util.NoSuchElementException is generated
+    // in the scanner. This is an annoying problem but I have no interest
+    // in resolving it
+    this.mainClass = readString(command_stream);
     // Target program args separated by \u0000
-    String mainArgs = readString(fromBash);
+    String mainArgs = readString(command_stream);
     // System properties separated by \u0000, i.e. -DA=B\u0000-DX=Y
-    String runtimeArgs = readString(fromBash);
+    String runtimeArgs = readString(command_stream);
     // Environment variables separated by \u0000, i.e. A=B\u0000C=D
-    String environment = readString(fromBash);
-    fromBash.close();
+    String environment = readString(command_stream);
+    command_stream.close();
     Method main = mainMethod(mainClass);
     mergeEnv(parseEnv(environment));
     setProperties(runtimeArgs);
-//     switchStreams();
-    startIdleKiller();
     invoke(main, split(mainArgs, "\u0000"));
   }
 
   private Method mainMethod(String className)
     throws ClassNotFoundException, NoSuchMethodException
   {
-    if (className == null || className.equals("")) {
+    if (className == null || className.equals(""))
       throw new ClassNotFoundException("No class name specified");
-    } else {
-      return Class.forName(className, true, ClassLoader.getSystemClassLoader())
-        .getMethod("main", String[].class);
-    }
+
+    return Class.forName(className, true, ClassLoader.getSystemClassLoader())
+      .getMethod("main", String[].class);
   }
 
-  private String[] split(String str, String delim) {
+  private String[] split(String str, String delim)
+  {
     if (str.length() == 0) {
       return new String[0];
     } else {
@@ -115,11 +161,13 @@ public class Main {
     }
   }
 
-  private void invoke(Method main, String[] args) throws Exception {
+  private void invoke(Method main, String[] args) throws Exception
+  {
     main.invoke(null, (Object)args);
   }
 
-  private void setProperties(String runtimeArgs) {
+  private void setProperties(String runtimeArgs)
+  {
     Matcher m = Pattern.compile("-D([^=]+)=([^\u0000]+)").matcher(runtimeArgs);
 
     while (m.find()) {
@@ -127,7 +175,8 @@ public class Main {
     }
   }
 
-  private Map<String, String> parseEnv(String str) {
+  private Map<String, String> parseEnv(String str)
+  {
     Map<String, String> env = new HashMap<String, String>();
 
     for (String line: split(str, "\u0000")) {
@@ -139,7 +188,8 @@ public class Main {
 
   @SuppressWarnings("unchecked")
   private void mergeEnv(Map<String, String> newEnv)
-    throws NoSuchFieldException, IllegalAccessException {
+    throws NoSuchFieldException, IllegalAccessException
+  {
     Map<String, String> env = System.getenv();
     Class<?> classToHack = env.getClass();
     if (!(classToHack.getName().equals("java.util.Collections$UnmodifiableMap"))) {
@@ -152,57 +202,21 @@ public class Main {
     field.setAccessible(false);
   }
 
-  @SuppressWarnings("unchecked")
-  static void replaceFileDescriptor(FileDescriptor a, FileDescriptor b)
-    throws NoSuchFieldException, IllegalAccessException {
-    Field field = FileDescriptor.class.getDeclaredField("fd");
-    field.setAccessible(true);
-    field.set(a, field.get(b));
-    field.setAccessible(false);
-  }
-
-  private void flip(Switchable s) throws IllegalStateException, IOException {
-    while (! s.path().exists()) {
-      try {
-        Thread.sleep(50);
-      } catch (InterruptedException e) {
-      }
-    }
-    s.flip();
-  }
-
-  private void reopenStreams() throws FileNotFoundException, IOException {
-    this.fifo = new File(this.dir, String.format("control.%s", unique_id));
+  /** Open the child stdout and stderr as files and named pipe control channel */
+  private void reopenStreams() throws FileNotFoundException, IOException
+  {
     System.setOut(new PrintStream(new File(dir, String.format("stdout.%s", unique_id))));
     System.setErr(new PrintStream(new File(dir, String.format("stderr.%s", unique_id))));
-
-//     this.in  = new SwitchableInputStream(
-//         System.in, new File(dir, String.format("stdin.%s", unique_id)
-//     );
-//     this.out = new SwitchableOutputStream(
-//         System.out, new File(dir, String.format("stdout.%s", unique_id)
-//     );
-//     this.err = new SwitchableOutputStream(
-//         System.err, new File(dir, String.format("stderr.%s", unique_id)
-//     );
-
-//     System.setIn(new BufferedInputStream(in));
-//     System.setOut(new PrintStream(out));
-//     System.setErr(new PrintStream(err));
-  }
-
-  private void switchStreams() throws Exception {
-    flip(in);
-    flip(out);
-    flip(err);
-
-    replaceFileDescriptor(FileDescriptor.in,  this.in.getFD());
-    replaceFileDescriptor(FileDescriptor.out, this.out.getFD());
-    replaceFileDescriptor(FileDescriptor.err, this.err.getFD());
+    if (this.is_linux) {
+      this.fifo = new File(this.dir, String.format("control.%s", unique_id));
+    } else if (this.is_windows) {
+      this.fifo = new File(String.format("\\\\.\\pipe\\preforkj.control.%s", unique_id));
+    }
   }
 
   private static final Pattern EVERYTHING = Pattern.compile(".+", Pattern.DOTALL);
-  private String readString(Scanner s) throws IOException {
+  private String readString(Scanner s) throws IOException
+  {
     s.useDelimiter(":");
     int numChars = s.nextInt();
     s.skip(":");
