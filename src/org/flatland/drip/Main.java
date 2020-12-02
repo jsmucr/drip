@@ -138,7 +138,6 @@ public class Main
     setProperties(runtimeArgs);
     System.out.printf("%1$tT.%1$tL - Invoking Method '%2$s'\n", new Date(), main);
     Object retval = invoke(main, split(mainArgs, "\u0000"));
-    System.out.printf("6 %1$tT.%1$tL\n", new Date());
     System.out.printf("%1$tT.%1$tL - Method '%2$s' finished, returned '%3$s'\n", new Date(), main, retval);
   }
 
