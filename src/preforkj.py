@@ -47,7 +47,7 @@ class CJavaPrefork(object):
     DRIP_JAR = "drip.jar"
     DRIP_MAIN = "org.flatland.drip.Main"
     # application.name is just useful in case you need to quickly identify stale processes with jps
-    DEFAULT_OPTIONS = ("-Djava.awt.headless=true", "-Dapplication.name=CJavaPrefork")
+    DEFAULT_OPTIONS = ("-Dapplication.name=CJavaPrefork",)
     # Default number of JVM instances to be forked
     DEFAULT_INSTANCES_NR = 2
 
@@ -58,8 +58,9 @@ class CJavaPrefork(object):
     # Child process status. We don't use enum as it would require a custom JSON serializer
     STATUS_IDLE = 0
     STATUS_COMMAND_SENT = 1
+    STATUS_EXITED = 2
 
-    def __init__(self, working_dir: str, drip_jar_path: typing.Optional[str] = None, java_path: str = "java"):
+    def __init__(self, working_dir: str, drip_jar_path: typing.Optional[typing.Union[pathlib.Path, str]] = None, java_path: str = "java"):
         """
         Initialize the Java preforker object.
 
@@ -78,11 +79,15 @@ class CJavaPrefork(object):
             self._working_dir.mkdir()
         except FileExistsError:
             pass
+        # Also hope it is writable
+        if not self._working_dir.is_dir():
+            raise RuntimeError("Working directory '{}' is not a directory".format(self._working_dir))
 
-        if drip_jar_path:
-            self._drip_jar_path = str(pathlib.Path(drip_jar_path).absolute())
-        else:
-            self._drip_jar_path = str((self._working_dir / self.DRIP_JAR).absolute())
+        drip_jar_path = pathlib.Path(drip_jar_path) if drip_jar_path else self._working_dir / self.DRIP_JAR
+        if not drip_jar_path.exists():
+            raise RuntimeError("DRIP jar does not exist at '{}'".format(drip_jar_path))
+
+        self._drip_jar_path = str(drip_jar_path.absolute())
 
         # All currently configured groups
         # key = group name
@@ -147,6 +152,9 @@ class CJavaPrefork(object):
                     ))
         return stream.getvalue()
 
+    def _dump_status(self):
+        self._status_fd.seek(0, 0)
+        json.dump(self._status, self._status_fd)
 
     def _mkfifoname_unix(self, unique_id: str) -> str:
         return "control.{}".format(unique_id)
@@ -207,10 +215,22 @@ class CJavaPrefork(object):
         elif _is_win:
             unique_id = process_info["unique_id"]
             handle = self._control_handles[unique_id]
-            for line in data:
+            for line in encoded:
                 self.logger.debug("_writefifo '%s'", line)
-                win32file.WriteFile(handle, line)
+                errcode, nbytes = win32file.WriteFile(handle, line)
+                if nbytes != len(line):
+                    raise RuntimeError("Short write {}/{}".format(nbytes, len(line)))
 
+            # Block until all data has been read by the client
+            win32file.FlushFileBuffers(handle)
+
+    def _disconnectfifo(self, process_info):
+        if _is_win:
+            unique_id = process_info["unique_id"]
+            handle = self._control_handles[unique_id]
+            win32pipe.DisconnectNamedPipe(handle)
+            win32file.CloseHandle(handle)
+            del self._control_handles[unique_id]
 
     def prefork_jvm(
         self,
@@ -256,8 +276,7 @@ class CJavaPrefork(object):
             while idle_count > 0:
                 self._run_jvm(group_name, extended_classpath, shutdown_timeout_m, *args)
                 idle_count -= 1
-            self._status_fd.seek(0, 0)
-            json.dump(self._status, self._status_fd)
+            self._dump_status()
 
     def _run_jvm(self, group_name: str, classpath: str, shutdown_timeout_m: int, *args) -> None:
         processes = self._status.setdefault(group_name, [])
@@ -317,7 +336,7 @@ class CJavaPrefork(object):
         :param target_program_args: target program command line arguments
         :param target_system_properties: target JVM properties to be set
         :param target_environment: target JVM environment to be merged in
-        :return: selected JVM PID
+        :return: selected JVM process return code (details vary depending on the platform, see psutil.Process.wait)
         """
         try:
             processes = self._status[group]
@@ -326,6 +345,12 @@ class CJavaPrefork(object):
 
         for process_info in processes:
             if process_info["status"] == self.STATUS_IDLE:
+                PID = process_info["pid"]
+                process = psutil.Process(PID)
+                if not process.is_running():
+                    raise RuntimeError("Selected process with PID {} is not running".format(PID))
+
+                self.logger.info("Selected PID %d to execute class %s", PID, main_class)
                 program_args = "\u0000".join(target_program_args) \
                         if target_program_args else ""
                 system_properties = "\u0000".join(target_system_properties) \
@@ -340,15 +365,21 @@ class CJavaPrefork(object):
                 )
                 self._writefifo(process_info, data_lines)
 
+                unique_id = process_info["unique_id"]
                 process_info["status"] = self.STATUS_COMMAND_SENT
-                self._status_fd.seek(0, 0)
-                json.dump(self._status, self._status_fd)
+                self._dump_status()
                 self.logger.info(
                     "PID %d UID %s executes class %s(%s) with classpath '%s' system properties %s, environment %s",
-                    process_info["pid"], process_info["unique_id"], main_class, target_program_args,
+                    PID, unique_id, main_class, target_program_args,
                     process_info["classpath"], target_system_properties, target_environment
                 )
-                return process_info["pid"]
+                retval = process.wait()
+                self.logger.info("PID %d exited with exit code %d", PID, retval)
+                self._disconnectfifo(process_info)
+                process_info["status"] = self.STATUS_EXITED
+                self._dump_status()
+
+                return retval, self._working_dir / "stdout.{}".format(unique_id), self._working_dir / "stderr.{}".format(unique_id)
 
         raise ProcessLookupError("No preforked idle process available in group '{}'".format(group))
 
@@ -375,8 +406,7 @@ class CJavaPrefork(object):
 
             [processes.remove(item) for item in to_reap]
 
-        self._status_fd.seek(0, 0)
-        json.dump(self._status, self._status_fd)
+        self._dump_status()
 
     # Properties --------------------------------------------------------------
     @property
