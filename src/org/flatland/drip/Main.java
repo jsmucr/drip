@@ -6,6 +6,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.io.*;
+import java.util.Date;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.Scanner;
@@ -39,12 +40,13 @@ public class Main
   //! Unique JVM group instance ID assigned by parent
   private String unique_id;
   //! Control FIFO
-  private File fifo;
+  private FileInputStream fifo;
   /** Max running time in minutes. If 0 no maximum running time.
    *  If the child real entry point does not exit within this
    *  time the JVM instance is shut down.
    */
   private int max_running_time_m;
+  private Thread idle_killer;
   private boolean is_windows;
   private boolean is_linux;
 
@@ -75,10 +77,12 @@ public class Main
 
     if (this.is_linux) {
       // standard mkfifo on *NIX
-      this.fifo = new File(this.dir, String.format("control.%s", unique_id));
+      this.fifo = new FileInputStream(new File(this.dir, String.format("control.%s", unique_id)));
     } else if (this.is_windows) {
       // windows flavour
-      this.fifo = new File(String.format("\\\\.\\pipe\\preforkj.control.%s", unique_id));
+      // DO NOT USE File as, on windows, the client will NOT read bytes until the server end of
+      // the pipe is closed
+      this.fifo = new FileInputStream(String.format("\\\\.\\pipe\\preforkj.control.%s", unique_id));
     }
 
     String idleTimeStr = System.getenv("DRIP_SHUTDOWN"); // in minutes
@@ -101,14 +105,14 @@ public class Main
   private void startIdleKiller()
   {
     if (this.max_running_time_m != 0) {
-      Thread idleKiller = new Thread() {
+      this.idle_killer = new Thread() {
           public void run() {
             killAfterTimeout();
           }
         };
 
-      idleKiller.setDaemon(true);
-      idleKiller.start();
+      this.idle_killer.setDaemon(true);
+      this.idle_killer.start();
     }
   }
 
@@ -132,7 +136,10 @@ public class Main
     Method main = mainMethod(mainClass);
     mergeEnv(parseEnv(environment));
     setProperties(runtimeArgs);
-    invoke(main, split(mainArgs, "\u0000"));
+    System.out.printf("%1$tT.%1$tL - Invoking Method '%2$s'\n", new Date(), main);
+    Object retval = invoke(main, split(mainArgs, "\u0000"));
+    System.out.printf("6 %1$tT.%1$tL\n", new Date());
+    System.out.printf("%1$tT.%1$tL - Method '%2$s' finished, returned '%3$s'\n", new Date(), main, retval);
   }
 
   private Method mainMethod(String className)
@@ -161,9 +168,9 @@ public class Main
     }
   }
 
-  private void invoke(Method main, String[] args) throws Exception
+  private Object invoke(Method main, String[] args) throws Exception
   {
-    main.invoke(null, (Object)args);
+    return main.invoke(null, (Object)args);
   }
 
   private void setProperties(String runtimeArgs)
@@ -200,18 +207,6 @@ public class Main
     field.setAccessible(true);
     ((Map<String,String>)field.get(env)).putAll(newEnv);
     field.setAccessible(false);
-  }
-
-  /** Open the child stdout and stderr as files and named pipe control channel */
-  private void reopenStreams() throws FileNotFoundException, IOException
-  {
-    System.setOut(new PrintStream(new File(dir, String.format("stdout.%s", unique_id))));
-    System.setErr(new PrintStream(new File(dir, String.format("stderr.%s", unique_id))));
-    if (this.is_linux) {
-      this.fifo = new File(this.dir, String.format("control.%s", unique_id));
-    } else if (this.is_windows) {
-      this.fifo = new File(String.format("\\\\.\\pipe\\preforkj.control.%s", unique_id));
-    }
   }
 
   private static final Pattern EVERYTHING = Pattern.compile(".+", Pattern.DOTALL);
