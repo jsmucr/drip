@@ -53,18 +53,18 @@ test: jar test/clojure.jar test/jruby.jar test/scala test/test/Main.class
 test/test/Main.class: test/test/Main.java
 	${javac} $<
 
-clojure_url=http://repo1.maven.org/maven2/org/clojure/clojure/1.4.0/clojure-1.4.0.jar
-jruby_url=http://jruby.org.s3.amazonaws.com/downloads/1.7.0/jruby-complete-1.7.0.jar
-scala_url=http://www.scala-lang.org/downloads/distrib/files/scala-2.9.2.tgz
+clojure_url=https://repo1.maven.org/maven2/org/clojure/clojure/1.4.0/clojure-1.4.0.jar
+jruby_url=https://repo1.maven.org/maven2/org/jruby/jruby-complete/9.3.1.0/jruby-complete-9.3.1.0.jar
+scala_url=https://scala-lang.org/files/archive/scala-2.9.2.tgz
 
 test/clojure.jar:
-	curl -# ${clojure_url} > $@
+	curl -L -# ${clojure_url} > $@
 
 test/jruby.jar:
-	curl -# ${jruby_url} > $@
+	curl -L -# ${jruby_url} > $@
 
 test/scala.tgz:
-	curl -# ${scala_url} > $@
+	curl -L -# ${scala_url} > $@
 
 test/scala: test/scala.tgz
 	tar xzf $< -m -C test
