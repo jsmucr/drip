@@ -10,7 +10,7 @@ function http_get { # Adapted from http://github.com/technomancy/leiningen
             http_get='wget -O'
         fi
     fi
-    mkdir -p "$(dirname $path)"
+    mkdir -p "$(dirname "$path")"
     echo "Downloading $url..." >&2
     $http_get "$path.pending" "$url" || return 1
     mv -- "$path.pending" "$path"
@@ -26,8 +26,10 @@ function bootstrap {
     # Adapted from http://github.com/technomancy/leiningen
     # resolve symlinks to the script itself portably
     while [[ -h $script ]] ; do
-        local ls=$(ls -ld -- "$script")
-        local link=$(expr -- "$ls" : '.*-> \(.*\)$')
+        local ls
+        ls=$(ls -ld -- "$script")
+        local link
+        link=$(expr -- "$ls" : '.*-> \(.*\)$')
         if expr -- "$link" : '/.*' > /dev/null; then
             script=$link
         else
@@ -35,7 +37,8 @@ function bootstrap {
         fi
     done
 
-    local bin_dir=$(dirname $script)
+    local bin_dir
+    bin_dir=$(dirname "$script")
     drip_dir=$bin_dir/..
     if [[ -r $drip_dir/src/org/flatland/drip/Main.java ]]; then
         # Checkout or package
@@ -74,7 +77,7 @@ function compile {
         src_file=$drip_dir/src/$base.c
     fi
     if [[ $src_file -nt $bin_file ]]; then
-        gcc $src_file -o $bin_file
+        gcc "$src_file" -o "$bin_file"
     fi
     echo "$bin_file"
 }
@@ -92,9 +95,11 @@ declare -a runtime_args
 
 function jar_main_class {
     local jar=$1
-    local line=$(unzip -p $jar META-INF/MANIFEST.MF | grep ^Main-Class:)
-    local main_class=$(expr -- "$line" : 'Main-Class: \([^[:space:]]*\)')
-    echo $main_class
+    local line=
+    line=$(unzip -p "$jar" META-INF/MANIFEST.MF | grep ^Main-Class:)
+    local main_class=
+    main_class=$(expr -- "$line" : 'Main-Class: \([^[:space:]]*\)')
+    echo "$main_class"
 }
 
 function parse_args {
@@ -134,7 +139,7 @@ function parse_args {
             else
                 classpath=$arg
                 if [[ $context == '-jar' ]]; then
-                    main_class=$(jar_main_class $arg)
+                    main_class=$(jar_main_class "$arg")
                 fi
                 unset context
             fi
@@ -150,21 +155,23 @@ function make_sha_path {
     sha=$(echo -n "$opts" | git hash-object --stdin)
     sha_path=$drip_root/$sha
     mkdir -p "$sha_path"
-    echo -n "$opts" > $sha_path/opts
+    echo -n "$opts" > "$sha_path/opts"
 }
 
 function default_init {
-    local f='%s\n%s'
     case $main_class in
         clojure.main)
             DRIP_INIT_CLASS='clojure.main'
-            DRIP_INIT=$(printf $f '-e' 'nil');;
+            DRIP_INIT='-e'$'\n''nil'
+            ;;
         org.jruby.Main)
             DRIP_INIT_CLASS='org.jruby.main.DripMain'
-            DRIP_INIT=$(printf $f '1 + 1');;
+            DRIP_INIT='1 + 1'$'\n'
+            ;;
         scala.tools.nsc.MainGenericRunner)
             DRIP_INIT_CLASS='scala.tools.nsc.MainGenericRunner'
-            DRIP_INIT=$(printf $f '-e' 'null');;
+            DRIP_INIT='-e'$'\n''null'
+            ;;
     esac
 }
 
@@ -180,17 +187,19 @@ function launch_jvm {
         export DRIP_INIT_CLASS=${DRIP_INIT_CLASS//\//.}
         export DRIP_INIT
 
-        $drip_daemon $DRIP_JAVA_CMD "${jvm_args[@]}" -Djava.awt.headless=true \
-                                    "-classpath" "$drip_jar:$classpath" \
-                                    org.flatland.drip.Main "$main_class" "$jvm_dir" \
-                                    > /dev/null 2> $drip_root/error.log
+
+        $drip_daemon "$DRIP_JAVA_CMD" "${jvm_args[@]}" -Djava.awt.headless=true \
+                                      "-classpath" "$drip_jar:$classpath" \
+                                      org.flatland.drip.Main "$main_class" "$jvm_dir" \
+                                      > /dev/null 2> "$drip_root/error.log"
     fi
 }
 
 function kill_jvm {
     local signal=$1
-    local pid=$(cat "$jvm_dir/jvm.pid" 2> /dev/null)
-    kill "$signal" $pid 2> /dev/null
+    local pid=
+    pid=$(cat "$jvm_dir/jvm.pid" 2> /dev/null)
+    kill "$signal" "$pid" 2> /dev/null
 }
 
 function lock_dir {
@@ -209,22 +218,22 @@ function lock_dir {
 function find_jvm {
     make_sha_path
 
-    for jvm_dir in $sha_path/*-*; do
-        if [[ -z $active_jvm_dir ]]; then
+    for jvm_dir in "$sha_path"/*-*; do
+        if [[ -z "$active_jvm_dir" ]]; then
             lock_dir
-        elif [[ ! -e $jvm_dir/lock ]]; then
-            let n=$n+1
+        elif [[ ! -e "$jvm_dir/lock" ]]; then
+            (( n++ ))
         fi
     done
 
     n=${n:-0}
 
-    while (( $n < $DRIP_POOL )); do
-        let n=$n+1
+    while (( n < DRIP_POOL )); do
+        (( n++ ))
         launch_jvm
     done
 
-    if [[ -z $active_jvm_dir ]]; then
+    if [[ -z "$active_jvm_dir" ]]; then
         exec "$DRIP_JAVA_CMD" "${jvm_args[@]}" "${runtime_args[@]}" \
                               "-classpath" "$classpath" \
                               "$main_class" "${main_args[@]}"
@@ -234,20 +243,21 @@ function find_jvm {
 function kill_jvms {
     local killed=false
 
-    for version_dir in $DRIP_HOME/*; do
-        [[ -d $version_dir ]] || continue
-        for sha_dir in $version_dir/*; do
-            [[ -d $sha_dir ]] || continue
-            [[ $sha_dir != $version_dir/src ]] || continue
-            for jvm_dir in $sha_dir/*-*; do
-                [[ -d $jvm_dir ]] || continue
+    for version_dir in "$DRIP_HOME"/*; do
+        [[ -d "$version_dir" ]] || continue
+        for sha_dir in "$version_dir"/*; do
+            [[ -d "$sha_dir" ]] || continue
+            [[ "$sha_dir" != "$version_dir/src" ]] || continue
+            for jvm_dir in "$sha_dir"/*-*; do
+                [[ -d "$jvm_dir" ]] || continue
                 if lock_dir; then
                     kill_jvm "$1"
                     rm -rf "$jvm_dir"
                     killed=true
                 fi
             done
-            local dirs=($sha_dir/*)
+            local dirs
+            dirs=("$sha_dir"/*)
             if [[ "${dirs[*]}" == "$sha_dir/opts" ]]; then
                 rm -rf "$sha_dir"
             fi
@@ -260,7 +270,7 @@ function kill_jvms {
 function send_array {
     local string=$*
     local length=${#string}
-    (( $length != 0 )) && let length=length+1
+    (( length != 0 )) && (( length++ ))
 
     printf '%s:' "$length"
     for e; do
@@ -283,7 +293,7 @@ function send_env {
             [[ $line == $var=*  ]] && continue 2
         done
 
-        vars+=("$(eval echo $line)")
+        vars+=("$(eval echo "$line")")
     done <<< "$(bash -c declare)"
 
     send_array "${vars[@]}"
@@ -314,13 +324,16 @@ function run_drip_command {
     case $drip_command in
         version)
             if [[ $drip_install == checkout ]]; then
-                git_sha="$(cd "$drip_dir"; git rev-parse --short HEAD)"
+                git_sha="$(cd "$drip_dir" && git rev-parse --short HEAD)"
             fi
-            printf 'drip version "%s" %s %s\n' $DRIP_VERSION $drip_install $git_sha;;
+            printf 'drip version "%s" %s %s\n' "$DRIP_VERSION" $drip_install "$git_sha"
+            ;;
         kill)
-            kill_jvms "$2";;
+            kill_jvms "$2"
+            ;;
         ps)
-            jps -vlm | grep org.flatland.drip.Main;;
+            jps -vlm | grep org.flatland.drip.Main
+            ;;
         upgrade)
             case $drip_install in
                 standalone)
@@ -335,10 +348,12 @@ function run_drip_command {
                     echo '  brew update && brew upgrade drip'
             esac
             bootstrap
-            exit $?;;
+            exit $?
+            ;;
         *)
-            echo Unknown command: $drip_command
-            exit 1;;
+            echo "Unknown command: $drip_command"
+            exit 1
+            ;;
     esac
 }
 
@@ -353,19 +368,19 @@ DRIP_JAR_URL=${DRIP_JAR_URL:-$DRIP_REPO/org/flatland/drip/$DRIP_VERSION/drip-$DR
 DRIP_BIN_URL=${DRIP_BIN_URL:-https://raw.github.com/flatland/drip/$DRIP_BRANCH/bin/drip}
 DRIP_SRC_URL=${DRIP_SRC_URL:-https://raw.github.com/flatland/drip/$DRIP_BRANCH/src}
 DRIP_JAVA_CMD=${DRIP_JAVA_CMD:-java}
-DRIP_JAVA_CMD=$(which $DRIP_JAVA_CMD)
+DRIP_JAVA_CMD=$(command -v "$DRIP_JAVA_CMD")
 MVN_REPO=${MVN_REPO:-~/.m2/repository}
 
 bootstrap
 
 parse_args "$@"
 
-if [[ -z $drip_command ]]; then
-    [[ -z $java_command ]] || exec "$DRIP_JAVA_CMD" $java_command
+if [[ -z "$drip_command" ]]; then
+    [[ -z "$java_command" ]] || exec "$DRIP_JAVA_CMD" "$java_command"
     find_jvm
     run_main
 
-    exit $status
+    exit "$status"
 else
-    run_drip_command
+    run_drip_command "$@"
 fi
