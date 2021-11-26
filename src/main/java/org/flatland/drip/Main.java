@@ -28,39 +28,32 @@ import java.util.regex.Pattern;
  * works for windows.
  */
 public class Main {
-    private String mainClass;
-    //! Working directory
-    private File dir;
-    //! Unique JVM group instance ID assigned by parent
-    private String unique_id;
     //! Control FIFO
-    private FileInputStream fifo;
+    private final FileInputStream fifo;
     /**
      * Max running time in minutes. If 0 no maximum running time.
      * If the child real entry point does not exit within this
      * time the JVM instance is shut down.
      */
-    private int max_running_time_m;
-    private Thread idle_killer;
-    private boolean is_windows;
-    private boolean is_linux;
+    private final int max_running_time_m;
 
     //! Default maximum running time in minutes
     public static final int MAX_RUNNING_TIME_M = 5;
 
-    public static void main(String[] args) throws IOException, Exception {
+    public static void main(String[] args) throws Exception {
         new Main(args[0], args[1]).start();
     }
 
     public Main(String unique_id, String working_directory) throws IOException {
         String current_os = System.getProperty("os.name").toLowerCase();
-        this.is_windows = (current_os.indexOf("win") >= 0);
-        this.is_linux = (current_os.indexOf("nux") >= 0);
-        if ((!this.is_windows) && (!this.is_linux))
+        boolean is_windows = current_os.contains("win");
+        boolean is_linux = current_os.contains("nux");
+        if ((!is_windows) && (!is_linux))
             throw new UnsupportedOperationException("Unsupported OS");
 
-        this.unique_id = unique_id;
-        this.dir = new File(working_directory);
+        //! Unique JVM group instance ID assigned by parent
+        //! Working directory
+        File dir = new File(working_directory);
         // We don't rely on stdin and have our own stdout/err files
         System.in.close();
         System.out.close();
@@ -68,10 +61,10 @@ public class Main {
         System.setOut(new PrintStream(new File(dir, String.format("stdout.%s", unique_id))));
         System.setErr(new PrintStream(new File(dir, String.format("stderr.%s", unique_id))));
 
-        if (this.is_linux) {
+        if (is_linux) {
             // standard mkfifo on *NIX
-            this.fifo = new FileInputStream(new File(this.dir, String.format("control.%s", unique_id)));
-        } else if (this.is_windows) {
+            this.fifo = new FileInputStream(new File(dir, String.format("control.%s", unique_id)));
+        } else { // if (is_windows)
             // windows flavour
             // DO NOT USE File as, on windows, the client will NOT read bytes until the server end of
             // the pipe is closed
@@ -85,7 +78,7 @@ public class Main {
 
     private void killAfterTimeout() {
         try {
-            Thread.sleep(this.max_running_time_m * 60 * 1000); // convert minutes to ms
+            Thread.sleep(this.max_running_time_m * 60L * 1000L); // convert minutes to ms
         } catch (InterruptedException e) {
             System.err.println("drip: Interrupted timeout thread??");
             return; // I guess someone wanted to kill the timeout thread?
@@ -96,14 +89,14 @@ public class Main {
 
     private void startIdleKiller() {
         if (this.max_running_time_m != 0) {
-            this.idle_killer = new Thread() {
+            Thread idle_killer = new Thread() {
                 public void run() {
                     killAfterTimeout();
                 }
             };
 
-            this.idle_killer.setDaemon(true);
-            this.idle_killer.start();
+            idle_killer.setDaemon(true);
+            idle_killer.start();
         }
     }
 
@@ -115,7 +108,7 @@ public class Main {
         // don't have any data and a java.util.NoSuchElementException is generated
         // in the scanner. This is an annoying problem but I have no interest
         // in resolving it
-        this.mainClass = readString(command_stream);
+        String mainClass = readString(command_stream);
         // Target program args separated by \u0000
         String mainArgs = readString(command_stream);
         // System properties separated by \u0000, i.e. -DA=B\u0000-DX=Y
