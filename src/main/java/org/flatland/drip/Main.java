@@ -4,15 +4,12 @@ import java.lang.System;
 import java.lang.UnsupportedOperationException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Field;
-import java.lang.reflect.Modifier;
 import java.io.*;
 import java.util.Date;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.Scanner;
 import java.util.LinkedList;
-import java.util.List;
-import java.util.Arrays;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -86,7 +83,7 @@ public class Main
     }
 
     String idleTimeStr = System.getenv("DRIP_SHUTDOWN"); // in minutes
-    this.max_running_time_m = (idleTimeStr == null) ? this.MAX_RUNNING_TIME_M : Integer.parseInt(idleTimeStr);
+    this.max_running_time_m = (idleTimeStr == null) ? MAX_RUNNING_TIME_M : Integer.parseInt(idleTimeStr);
     startIdleKiller();
   }
 
@@ -156,14 +153,15 @@ public class Main
     if (str.length() == 0) {
       return new String[0];
     } else {
-      Scanner s = new Scanner(str);
-      s.useDelimiter(delim);
+      try (Scanner s = new Scanner(str)) {
+        s.useDelimiter(delim);
 
-      LinkedList<String> list = new LinkedList<String>();
-      while (s.hasNext()) {
-        list.add(s.next());
+        LinkedList<String> list = new LinkedList<String>();
+        while (s.hasNext()) {
+          list.add(s.next());
+        }
+        return list.toArray(new String[0]);
       }
-      return list.toArray(new String[0]);
     }
   }
 
