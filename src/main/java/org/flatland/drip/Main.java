@@ -35,87 +35,83 @@ public class Main {
      * If the child real entry point does not exit within this
      * time the JVM instance is shut down.
      */
-    private final int max_running_time_m;
+    private final int maxRunningTimeMinutes;
 
     //! Default maximum running time in minutes
-    public static final int MAX_RUNNING_TIME_M = 5;
+    public static final int MAX_RUNNING_TIME_MINUTES = 5;
 
     public static void main(String[] args) throws Exception {
         new Main(args[0], args[1]).start();
     }
 
-    public Main(String unique_id, String working_directory) throws IOException {
-        String current_os = System.getProperty("os.name").toLowerCase();
-        boolean is_windows = current_os.contains("win");
-        boolean is_linux = current_os.contains("nux");
-        if ((!is_windows) && (!is_linux))
+    public Main(String uniqueId, String workingDirectory) throws IOException {
+        String currentOs = System.getProperty("os.name").toLowerCase();
+        boolean isWindows = currentOs.contains("win");
+        boolean isLinux = currentOs.contains("nux");
+        if ((!isWindows) && (!isLinux))
             throw new UnsupportedOperationException("Unsupported OS");
 
         //! Unique JVM group instance ID assigned by parent
         //! Working directory
-        File dir = new File(working_directory);
+        File dir = new File(workingDirectory);
         // We don't rely on stdin and have our own stdout/err files
         System.in.close();
         System.out.close();
         System.err.close();
-        System.setOut(new PrintStream(new File(dir, String.format("stdout.%s", unique_id))));
-        System.setErr(new PrintStream(new File(dir, String.format("stderr.%s", unique_id))));
+        System.setOut(new PrintStream(new File(dir, String.format("stdout.%s", uniqueId))));
+        System.setErr(new PrintStream(new File(dir, String.format("stderr.%s", uniqueId))));
 
-        if (is_linux) {
+        if (isLinux) {
             // standard mkfifo on *NIX
-            this.fifo = new FileInputStream(new File(dir, String.format("control.%s", unique_id)));
-        } else { // if (is_windows)
+            this.fifo = new FileInputStream(new File(dir, String.format("control.%s", uniqueId)));
+        } else { // if (isWindows)
             // windows flavour
             // DO NOT USE File as, on windows, the client will NOT read bytes until the server end of
             // the pipe is closed
-            this.fifo = new FileInputStream(String.format("\\\\.\\pipe\\preforkj.control.%s", unique_id));
+            this.fifo = new FileInputStream(String.format("\\\\.\\pipe\\preforkj.control.%s", uniqueId));
         }
 
         String idleTimeStr = System.getenv("DRIP_SHUTDOWN"); // in minutes
-        this.max_running_time_m = (idleTimeStr == null) ? MAX_RUNNING_TIME_M : Integer.parseInt(idleTimeStr);
+        this.maxRunningTimeMinutes = (idleTimeStr == null) ? MAX_RUNNING_TIME_MINUTES : Integer.parseInt(idleTimeStr);
         startIdleKiller();
     }
 
     private void killAfterTimeout() {
         try {
-            Thread.sleep(this.max_running_time_m * 60L * 1000L); // convert minutes to ms
+            Thread.sleep(this.maxRunningTimeMinutes * 60L * 1000L); // convert minutes to ms
         } catch (InterruptedException e) {
             System.err.println("drip: Interrupted timeout thread??");
             return; // I guess someone wanted to kill the timeout thread?
         }
-        System.err.printf("Exiting after %d [min] timeout\n", this.max_running_time_m);
+        System.err.printf("Exiting after %d [min] timeout\n", this.maxRunningTimeMinutes);
         System.exit(0);
     }
 
     private void startIdleKiller() {
-        if (this.max_running_time_m != 0) {
-            Thread idle_killer = new Thread() {
-                public void run() {
-                    killAfterTimeout();
-                }
-            };
+        if (this.maxRunningTimeMinutes != 0) {
+            Thread idleKiller = new Thread(this::killAfterTimeout);
 
-            idle_killer.setDaemon(true);
-            idle_killer.start();
+            idleKiller.setDaemon(true);
+            idleKiller.start();
         }
     }
 
     public void start() throws Exception {
         // Will block until we get commands
-        Scanner command_stream = new Scanner(this.fifo);
+        Scanner commandStream = new Scanner(this.fifo);
         // On windows if the parent exits (or disconnects the server pipe handle)
         // it is treated as an event that unblocks read, but of course we
         // don't have any data and a java.util.NoSuchElementException is generated
         // in the scanner. This is an annoying problem but I have no interest
         // in resolving it
-        String mainClass = readString(command_stream);
+        String mainClass = readString(commandStream);
         // Target program args separated by \u0000
-        String mainArgs = readString(command_stream);
+        String mainArgs = readString(commandStream);
         // System properties separated by \u0000, i.e. -DA=B\u0000-DX=Y
-        String runtimeArgs = readString(command_stream);
+        String runtimeArgs = readString(commandStream);
         // Environment variables separated by \u0000, i.e. A=B\u0000C=D
-        String environment = readString(command_stream);
-        command_stream.close();
+        String environment = readString(commandStream);
+        commandStream.close();
         Method main = mainMethod(mainClass);
         mergeEnv(parseEnv(environment));
         setProperties(runtimeArgs);
@@ -133,14 +129,14 @@ public class Main {
                 .getMethod("main", String[].class);
     }
 
-    private String[] split(String str, String delim) {
+    private String[] split(String str, String delimiter) {
         if (str.length() == 0) {
             return new String[0];
         } else {
             try (Scanner s = new Scanner(str)) {
-                s.useDelimiter(delim);
+                s.useDelimiter(delimiter);
 
-                LinkedList<String> list = new LinkedList<String>();
+                LinkedList<String> list = new LinkedList<>();
                 while (s.hasNext()) {
                     list.add(s.next());
                 }
@@ -162,7 +158,7 @@ public class Main {
     }
 
     private Map<String, String> parseEnv(String str) {
-        Map<String, String> env = new HashMap<String, String>();
+        Map<String, String> env = new HashMap<>();
 
         for (String line : split(str, "\u0000")) {
             String[] var = line.split("=", 2);
