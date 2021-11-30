@@ -1,152 +1,174 @@
 package org.flatland.drip;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.IOException;
-import java.io.PrintStream;
+import java.io.*;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.util.*;
+import java.security.Permission;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.Scanner;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/**
- * This is meant to be the entry point of a forked child
- * that waits for the another entry point (the real meat)
- * and executes it.
- * The purpose is to have a pool of preforked processes
- * waiting in order to amortize the JVM startup time.
- * Processes have an "unique ID" assigned by parent that is meant
- * to be used to group them.
- * They have their own file as stdout and stderr and do NOT
- * have stdin.
- * Stdout is stdout.<unique id> and stderr is stderr.<unique id>.
- * The communication channel is a java.io.Scanner on the top
- * of a named pipe created by the parent. A standard named pipe
- * control.<unique id> in the working directory is used on
- * *NIX (man mkfifo) and \\.\pipe\preforkj.control.<unique id>
- * works for windows.
- */
 public class Main {
-    //! Control FIFO
-    private final FileInputStream fifo;
-    /**
-     * Max running time in minutes. If 0 no maximum running time.
-     * If the child real entry point does not exit within this
-     * time the JVM instance is shut down.
-     */
-    private final int maxRunningTimeMinutes;
 
-    //! Default maximum running time in minutes
-    public static final int MAX_RUNNING_TIME_MINUTES = 5;
+    private static class DripExitException extends SecurityException {
+        public void printStackTrace(PrintStream out) {
+            throw this;
+        }
+        public void reallyPrintStackTrace(PrintStream out) {
+            super.printStackTrace(out);
+        }
+    }
+
+    private class DripSecurityManager extends SecurityManager {
+
+        private final SecurityManager base;
+
+        DripSecurityManager(SecurityManager base) {
+            this.base = base;
+        }
+
+        @Override
+        public void checkExit(int status) {
+            if (base != null) {
+                base.checkExit(status);
+            }
+            if (!exiting) {
+                throw new DripExitException();
+            }
+        }
+
+        @Override
+        public void checkPermission(Permission perm) {
+            if (base != null) {
+                base.checkPermission(perm);
+            }
+        }
+    }
+
+    private boolean exiting;
+
+    private final String mainClass;
+    private final File dir;
+    private SwitchableOutputStream err;
+    private SwitchableOutputStream out;
+    private SwitchableInputStream in;
+
+    public Main(String mainClass, String dir) {
+        this.mainClass = mainClass;
+        this.dir = new File(dir);
+        System.setSecurityManager(new DripSecurityManager(System.getSecurityManager()));
+    }
+
+    private void exit(int code) {
+        exiting = true;
+        System.exit(code);
+    }
+
+    private void killAfterTimeout() {
+        String idleTimeStr = System.getenv("DRIP_SHUTDOWN"); // in minutes
+        long idleTime;
+        if (idleTimeStr == null) {
+            idleTime = 4 * 60; // four hours
+        } else {
+            idleTime = Integer.parseInt(idleTimeStr);
+        }
+
+        try {
+            Thread.sleep(idleTime * 60 * 1000); // convert minutes to ms
+        } catch (InterruptedException e) {
+            System.err.println("drip: Interrupted??");
+            return; // I guess someone wanted to kill the timeout thread?
+        }
+
+        File lockDir = new File(dir, "lock");
+        if (lockDir.mkdir()) {
+            exit(0);
+        } else {
+            // someone is already connected; let the process finish
+        }
+    }
+
+    private void startIdleKiller() {
+        Thread idleKiller = new Thread(this::killAfterTimeout);
+
+        idleKiller.setDaemon(true);
+        idleKiller.start();
+    }
 
     public static void main(String[] args) throws Exception {
         new Main(args[0], args[1]).start();
     }
 
-    public Main(String uniqueId, String workingDirectory) throws IOException {
-        String currentOs = System.getProperty("os.name").toLowerCase();
-        boolean isWindows = currentOs.contains("win");
-        boolean isLinux = currentOs.contains("nux");
-        if ((!isWindows) && (!isLinux))
-            throw new UnsupportedOperationException("Unsupported OS");
-
-        //! Unique JVM group instance ID assigned by parent
-        //! Working directory
-        File dir = new File(workingDirectory);
-        // We don't rely on stdin and have our own stdout/err files
-        System.in.close();
-        System.out.close();
-        System.err.close();
-        System.setOut(new PrintStream(new File(dir, String.format("stdout.%s", uniqueId))));
-        System.setErr(new PrintStream(new File(dir, String.format("stderr.%s", uniqueId))));
-
-        if (isLinux) {
-            // standard mkfifo on *NIX
-            this.fifo = new FileInputStream(new File(dir, String.format("control.%s", uniqueId)));
-        } else { // if (isWindows)
-            // windows flavour
-            // DO NOT USE File as, on windows, the client will NOT read bytes until the server end of
-            // the pipe is closed
-            this.fifo = new FileInputStream(String.format("\\\\.\\pipe\\preforkj.control.%s", uniqueId));
-        }
-
-        String idleTimeStr = System.getenv("DRIP_SHUTDOWN"); // in minutes
-        this.maxRunningTimeMinutes = (idleTimeStr == null) ? MAX_RUNNING_TIME_MINUTES : Integer.parseInt(idleTimeStr);
-        startIdleKiller();
-    }
-
-    private void killAfterTimeout() {
-        try {
-            Thread.sleep(this.maxRunningTimeMinutes * 60L * 1000L); // convert minutes to ms
-        } catch (InterruptedException e) {
-            System.err.println("drip: Interrupted timeout thread??");
-            return; // I guess someone wanted to kill the timeout thread?
-        }
-        System.err.printf("Exiting after %d [min] timeout\n", this.maxRunningTimeMinutes);
-        System.exit(0);
-    }
-
-    private void startIdleKiller() {
-        if (this.maxRunningTimeMinutes != 0) {
-            Thread idleKiller = new Thread(this::killAfterTimeout);
-
-            idleKiller.setDaemon(true);
-            idleKiller.start();
-        }
-    }
-
     public void start() throws Exception {
-        // Will block until we get commands
-        Scanner commandStream = new Scanner(this.fifo);
-        // On windows if the parent exits (or disconnects the server pipe handle)
-        // it is treated as an event that unblocks read, but of course we
-        // don't have any data and a java.util.NoSuchElementException is generated
-        // in the scanner. This is an annoying problem but I have no interest
-        // in resolving it
-        String mainClass = readString(commandStream);
-        // Target program args separated by \u0000
-        String mainArgs = readString(commandStream);
-        // System properties separated by \u0000, i.e. -DA=B\u0000-DX=Y
-        String runtimeArgs = readString(commandStream);
-        // Environment variables separated by \u0000, i.e. A=B\u0000C=D
-        String environment = readString(commandStream);
-        commandStream.close();
+        reopenStreams();
+
         Method main = mainMethod(mainClass);
+        Method init = mainMethod(System.getenv("DRIP_INIT_CLASS"));
+        String initArgs = System.getenv("DRIP_INIT");
+        if (initArgs != null) {
+            invoke(init == null ? main : init, split(initArgs, "\n"));
+        }
+        startIdleKiller();
+
+        Scanner fromBash = new Scanner(new File(dir, "control"));
+        String mainArgs = readString(fromBash);
+        String runtimeArgs = readString(fromBash);
+        String environment = readString(fromBash);
+        fromBash.close();
+
         mergeEnv(parseEnv(environment));
         setProperties(runtimeArgs);
-        System.out.printf("%1$tT.%1$tL - Invoking Method '%2$s'\n", new Date(), main);
-        Object retval = invoke(main, split(mainArgs, "\u0000"));
-        System.out.printf("%1$tT.%1$tL - Method '%2$s' finished, returned '%3$s'\n", new Date(), main, retval);
+        switchStreams();
+
+
+        try {
+            long start = System.currentTimeMillis();
+            try {
+                invoke(main, split(mainArgs, "\u0000"));
+            } catch (InvocationTargetException invocationTargetException) {
+                throw invocationTargetException.getCause();
+            } finally {
+                System.err.println("Spent time running: " + (System.currentTimeMillis() - start));
+            }
+        } catch (DripExitException ignored) {
+
+        } catch (Throwable t) {
+            System.err.println(main + " exited with an exception.");
+            t.printStackTrace(System.err);
+        }
     }
 
     private Method mainMethod(String className)
             throws ClassNotFoundException, NoSuchMethodException {
-        if (className == null || className.equals(""))
-            throw new ClassNotFoundException("No class name specified");
-
-        return Class.forName(className, true, ClassLoader.getSystemClassLoader())
-                .getMethod("main", String[].class);
-    }
-
-    private String[] split(String str, String delimiter) {
-        if (str.length() == 0) {
-            return new String[0];
+        if (className == null || className.equals("")) {
+            return null;
         } else {
-            try (Scanner s = new Scanner(str)) {
-                s.useDelimiter(delimiter);
-
-                LinkedList<String> list = new LinkedList<>();
-                while (s.hasNext()) {
-                    list.add(s.next());
-                }
-                return list.toArray(new String[0]);
-            }
+            return Class.forName(className, true, ClassLoader.getSystemClassLoader())
+                    .getMethod("main", String[].class);
         }
     }
 
-    private Object invoke(Method main, String[] args) throws Exception {
-        return main.invoke(null, (Object) args);
+    private String[] split(String str, String delim) {
+        if (str.length() == 0) {
+            return new String[0];
+        } else {
+            Scanner s = new Scanner(str);
+            s.useDelimiter(delim);
+
+            LinkedList<String> list = new LinkedList<>();
+            while (s.hasNext()) {
+                list.add(s.next());
+            }
+            return list.toArray(new String[0]);
+        }
+    }
+
+    private void invoke(Method main, String[] args) throws Exception {
+        main.invoke(null, (Object) args);
     }
 
     private void setProperties(String runtimeArgs) {
@@ -180,6 +202,45 @@ public class Main {
         field.setAccessible(true);
         ((Map<String, String>) field.get(env)).putAll(newEnv);
         field.setAccessible(false);
+    }
+
+    @SuppressWarnings("unchecked")
+    static void replaceFileDescriptor(FileDescriptor a, FileDescriptor b)
+            throws NoSuchFieldException, IllegalAccessException {
+        Field field = FileDescriptor.class.getDeclaredField("fd");
+        field.setAccessible(true);
+        field.set(a, field.get(b));
+        field.setAccessible(false);
+    }
+
+    private void flip(Switchable s) throws IllegalStateException, IOException {
+        while (!s.path().exists()) {
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException ignored) {
+            }
+        }
+        s.flip();
+    }
+
+    private void reopenStreams() {
+        this.in = new SwitchableInputStream(System.in, new File(dir, "in"));
+        this.out = new SwitchableOutputStream(System.out, new File(dir, "out"));
+        this.err = new SwitchableOutputStream(System.err, new File(dir, "err"));
+
+        System.setIn(new BufferedInputStream(in));
+        System.setOut(new PrintStream(out));
+        System.setErr(new PrintStream(err));
+    }
+
+    private void switchStreams() throws Exception {
+        flip(in);
+        flip(out);
+        flip(err);
+
+        replaceFileDescriptor(FileDescriptor.in, this.in.getFD());
+        replaceFileDescriptor(FileDescriptor.out, this.out.getFD());
+        replaceFileDescriptor(FileDescriptor.err, this.err.getFD());
     }
 
     private static final Pattern EVERYTHING = Pattern.compile(".+", Pattern.DOTALL);

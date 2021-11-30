@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+
+function bootstrap {
+    DRIP_ROOT="$DRIP_HOME/$DRIP_VERSION"
+    mkdir -p "$DRIP_ROOT"
+    DRIP_DIR=$(realpath "${0%/*}/..")
+    DRIP_JAR=$(find "$DRIP_DIR/lib" -name 'drip-*.jar' | head -1)
+    local BIN_DIR="$DRIP_DIR/bin"
+    DRIP_PROXY=$BIN_DIR/drip_proxy
+    DRIP_DAEMON=$BIN_DIR/drip_daemon
+}
+
+declare -a JVM_ARGS
+declare -a MAIN_ARGS
+declare -a RUNTIME_ARGS
+
+function jar_main_class {
+    local JAR=$1
+    local LINE
+    LINE=$(unzip -p "$JAR" META-INF/MANIFEST.MF | grep ^Main-Class:)
+    local MAIN_CLASS
+    MAIN_CLASS=$(expr -- "$LINE" : 'Main-Class: \([^[:space:]]*\)')
+    echo "$MAIN_CLASS"
+}
+
+function parse_args {
+    unset DRIP_COMMAND JAVA_COMMAND
+    if [[ $# -eq 0 ]]; then
+        echo 'Usage: drip [command | same args as java]'
+        echo
+        echo 'drip supports the following commands:'
+        echo '    version          print drip version and exit'
+        echo '    kill [-SIGNAL]   kill all idle drip JVMs (with SIGNAL)'
+        echo '    ps               print a list of all drip processes'
+        exit 0
+    elif ! expr -- "$1" : '.*[.-]' > /dev/null; then
+        DRIP_COMMAND=$1
+        return
+    elif [[ $# -eq 1 && $1 == -* ]]; then
+        JAVA_COMMAND=$1
+        return
+    fi
+
+    unset CLASSPATH MAIN_CLASS MAIN_ARGS RUNTIME_ARGS CONTEXT
+    for ARG in "$@"; do
+        if [[ -z $MAIN_CLASS ]]; then
+            if [[ -z $CONTEXT ]]; then
+                if [[ $ARG == "-cp" || $ARG == "-classpath" ]]; then
+                    CONTEXT='-cp'
+                elif [[ $ARG == "-jar" ]]; then
+                    CONTEXT='-jar'
+                elif [[ $ARG == --* ]]; then
+                    RUNTIME_ARGS+=("${ARG:1}")
+                elif [[ $ARG != -* ]]; then
+                    MAIN_CLASS=$ARG
+                else
+                    JVM_ARGS+=("$ARG")
+                fi
+            else
+                CLASSPATH=$ARG
+                if [[ $CONTEXT == '-jar' ]]; then
+                    MAIN_CLASS=$(jar_main_class "$ARG")
+                fi
+                unset CONTEXT
+            fi
+        else
+            MAIN_ARGS+=("$ARG")
+        fi
+    done
+    MAIN_CLASS=${MAIN_CLASS//\//.}
+}
+
+function make_sha_path {
+    OPTS="$PWD ${JVM_ARGS[*]} $CLASSPATH $MAIN_CLASS"
+    SHA=$(echo -N "$OPTS" | sha1sum | cut -f 1 -d ' ')
+    SHA_PATH="$DRIP_ROOT/$SHA"
+    mkdir -p "$SHA_PATH"
+    echo -N "$OPTS" > "$SHA_PATH/opts"
+}
+
+function default_init {
+    case "$MAIN_CLASS" in
+        clojure.main)
+            DRIP_INIT_CLASS='clojure.main'
+            DRIP_INIT='-e'$'\n''nil'
+            ;;
+        org.jruby.Main)
+            DRIP_INIT_CLASS='org.jruby.main.DripMain'
+            DRIP_INIT='1 + 1'$'\n'
+            ;;
+        scala.tools.nsc.MainGenericRunner)
+            DRIP_INIT_CLASS='scala.tools.nsc.MainGenericRunner'
+            DRIP_INIT='-e'$'\n''null'
+            ;;
+    esac
+}
+
+function launch_jvm {
+    JVM_DIR="$SHA_PATH/$$-$N"
+    if mkdir "$JVM_DIR"; then
+        mkfifo "$JVM_DIR/control"
+        if [[ -z $DRIP_INIT_CLASS ]]; then
+            default_init
+        fi
+        export DRIP_INIT_CLASS="${DRIP_INIT_CLASS//\//.}"
+        export DRIP_INIT
+        $DRIP_DAEMON "$DRIP_JAVA_CMD" "${JVM_ARGS[@]}" -Djava.awt.headless=true \
+                                      "-classpath" "$DRIP_JAR:$CLASSPATH" \
+                                      org.flatland.drip.Main "$MAIN_CLASS" "$JVM_DIR" \
+                                      > /dev/null 2> "$DRIP_ROOT/error.log"
+    fi
+}
+
+function kill_jvm {
+    local SIGNAL=$1
+    local PID
+    PID=$(cat "$JVM_DIR/jvm.pid" 2> /dev/null)
+    kill "$SIGNAL" "$PID" 2> /dev/null
+}
+
+function lock_dir {
+    if mkdir "$JVM_DIR/lock" 2> /dev/null; then
+        if kill_jvm -0; then
+            echo $$ > "$JVM_DIR/client.pid"
+            ACTIVE_JVM_DIR=$JVM_DIR
+            return 0
+        else
+            rm -rf "$JVM_DIR"
+        fi
+    fi
+    return 0
+}
+
+function find_jvm {
+    make_sha_path
+
+    for JVM_DIR in "$SHA_PATH"/*-*; do
+        if [[ -z "$ACTIVE_JVM_DIR" ]]; then
+            lock_dir
+        elif [[ ! -e "$JVM_DIR/lock" ]]; then
+            (( N++ ))
+        fi
+    done
+
+    N=${N:-0}
+
+    while (( N < DRIP_POOL )); do
+        (( N++ ))
+        launch_jvm
+    done
+
+    if [[ -z "$ACTIVE_JVM_DIR" ]]; then
+        exec "$DRIP_JAVA_CMD" "${JVM_ARGS[@]}" "${RUNTIME_ARGS[@]}" \
+                              '-classpath' "$CLASSPATH" \
+                              "$MAIN_CLASS" "${MAIN_ARGS[@]}"
+    fi
+}
+
+function kill_jvms {
+    local KILLED=false
+
+    for VERSION_DIR in "$DRIP_HOME"/*; do
+        [[ -d "$VERSION_DIR" ]] || continue
+        for SHA_DIR in "$VERSION_DIR"/*; do
+            [[ -d "$SHA_DIR" ]] || continue
+            [[ "$SHA_DIR" != "$VERSION_DIR/src" ]] || continue
+            for JVM_DIR in "$SHA_DIR"/*-*; do
+                [[ -d "$JVM_DIR" ]] || continue
+                if lock_dir; then
+                    kill_jvm "$1"
+                    rm -rf "$JVM_DIR"
+                    KILLED=true
+                fi
+            done
+            local DIRS
+            DIRS=("$SHA_DIR"/*)
+            if [[ "${DIRS[*]}" == "$SHA_DIR/opts" ]]; then
+                rm -rf "$SHA_DIR"
+            fi
+        done
+    done
+
+    [[ "$KILLED" == true ]] || echo "No idle Drip JVM running"
+}
+
+function send_array {
+    local STRING="$*"
+    local LENGTH=${#STRING}
+    (( LENGTH != 0 )) && (( LENGTH++ ))
+
+    printf '%s:' "$LENGTH"
+    for E; do
+        printf -- '%s\0' "$E"
+    done
+    printf ','
+}
+
+function send_env {
+    declare -a VARS
+
+    # Call declare in a bash subprocess to get rid of variables that aren't exported.
+    while read -r LINE; do
+        [[ "$LINE" == *=\(*\) ]] && continue # Filter bash arrays
+        [[ "$LINE" != *=*     ]] && break    # Filter function definitions
+
+        # Filter extra variables that were added by the bash subprocess but are not exported.
+        for VAR in BASH BASHOPTS BASH_EXECUTION_STRING BASH_VERSION \
+                   SHELLOPTS IFS PS4 UID EUID PPID; do
+            [[ "$LINE" == "$VAR="*  ]] && continue 2
+        done
+
+        VARS+=("$(eval echo "$LINE")")
+    done <<< "$(bash -c declare)"
+
+    send_array "${VARS[@]}"
+}
+
+function send_args {
+    mkfifo "$ACTIVE_JVM_DIR/status"
+    exec 4> "$ACTIVE_JVM_DIR/control"
+    send_array "${MAIN_ARGS[@]}" >&4
+    send_array "${RUNTIME_ARGS[@]}" >&4
+    send_env >&4
+    exec 4>&-
+}
+
+function wait_for_exit {
+    STATUS=$(cat "$ACTIVE_JVM_DIR/status")
+    rm -rf "$ACTIVE_JVM_DIR"
+}
+
+function run_main {
+    send_args
+    $DRIP_PROXY "$ACTIVE_JVM_DIR"
+
+    wait_for_exit
+}
+
+function run_drip_command {
+    case $DRIP_COMMAND in
+        version)
+            echo "drip version $DRIP_VERSION"
+            ;;
+        kill)
+            kill_jvms "$2"
+            ;;
+        ps)
+            jps -vlm | grep org.flatland.drip.Main
+            ;;
+        *)
+            echo "Unknown command: $DRIP_COMMAND"
+            exit 1
+            ;;
+    esac
+}
+
+# Let's go.
+
+DRIP_VERSION=0.2.5
+DRIP_POOL=${DRIP_POOL:-1}
+DRIP_HOME=${DRIP_HOME:-~/.drip}
+DRIP_JAVA_CMD=${DRIP_JAVA_CMD:-java}
+DRIP_JAVA_CMD=$(command -v "$DRIP_JAVA_CMD")
+
+bootstrap
+
+parse_args "$@"
+
+if [[ -z "$DRIP_COMMAND" ]]; then
+    [[ -z "$JAVA_COMMAND" ]] || exec "$DRIP_JAVA_CMD" "$JAVA_COMMAND"
+    find_jvm
+    run_main
+
+    exit "$STATUS"
+else
+    run_drip_command "$@"
+fi

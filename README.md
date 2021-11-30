@@ -22,26 +22,20 @@ in a directory with the hash value as its name.
 
 # Installation
 
-The following instructions assume that `~/bin` is on your `$PATH`. If that is
-not the case, you can substitute your favorite location.
+So far no precompiled package has been provided. You need to compile this version
+of Drip yourself using Gradle (GCC is also required) on Linux or another Unix
+based system:
 
-**Standalone** &mdash; *We recommend this to get started quickly.*
+    ./gradlew clean installDist
 
-    curl -L https://raw.githubusercontent.com/ninjudd/drip/master/bin/drip > ~/bin/drip
-    chmod 755 ~/bin/drip
+I believe this version does not work on Windows very well but it does on WSL.
 
-**Checkout** &mdash; *If you want to hack on Drip or follow the latest
-development, this is the way to go.*
+After running Gradle, a directory with Drip installation will be created:
 
-    git clone https://github.com/ninjudd/drip.git
-    cd drip && make prefix=~/bin install
+    build/install/
 
-**Homebrew** &mdash; *This is a convenient way to brew drip on OS X.*
-
-    brew install drip
-
-Note: Installing brew requires `gcc`. Here are [instructions](http://stackoverflow.com/questions/9353444)
-for how to install it on OS X Mountain Lion.
+This directory contains both native binaries and Drip JAR, and you can copy
+and use it wherever you like.
 
 # Usage
 
